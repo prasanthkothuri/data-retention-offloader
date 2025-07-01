@@ -1,0 +1,21 @@
+env: dev
+warehouse: s3a://lakehouse        # MinIO bucket
+
+connections:
+  nucleus_dev:
+    jdbc_url: jdbc:postgresql://nucleus-database-instance-1.cd55af1gjius.eu-west-2.rds.amazonaws.com:5432/nucleus_dev
+    user_env: PGUSER
+    password_env: PGPASSWORD
+    driver: org.postgresql.Driver
+
+sources:
+  - name: nucleus_dev
+    connection: nucleus_dev
+    include:
+      schemas: ["public"]
+      tables:  ["^sample_submission_.*$"]
+    exclude: {}
+    retention_policy: default_6m
+
+retention_policies:
+  default_6m: "6m"

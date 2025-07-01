@@ -1,0 +1,29 @@
+version: "3.9"
+services:
+  spark:
+    image: bitnami/spark:3.4.2
+    environment:
+      SPARK_MODE: master
+      SPARK_EXTRA_CLASSPATH: /opt/jars/*
+      AWS_ACCESS_KEY_ID: minio
+      AWS_SECRET_ACCESS_KEY: minio123
+      S3_ENDPOINT: http://minio:9000
+      GLUE_ENV: dev
+    volumes:
+      - ..:/workspace              # project root
+      - ./jars:/opt/jars           # Iceberg + JDBC jars
+    working_dir: /workspace
+    command: tail -f /dev/null     # keep container alive
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ':9001'
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    volumes:
+      - minio_data:/data
+volumes:
+  minio_data:
