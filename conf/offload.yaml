@@ -1,5 +1,5 @@
 env: dev
-warehouse: s3a://lakehouse        # MinIO bucket
+warehouse: s3a://bitbio.temp        # MinIO bucket
 
 connections:
   nucleus_dev:

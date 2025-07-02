@@ -30,4 +30,5 @@ docker compose -f docker/docker-compose.yml exec \
     --packages org.apache.hadoop:hadoop-aws:3.3.4,org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.5.0,org.postgresql:postgresql:42.7.3 \
     glue_jobs/bulk_offload.py \
     --config conf/offload.yaml \
-    --env dev
+    --env dev \
+    --mode local
