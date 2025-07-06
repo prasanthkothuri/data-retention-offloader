@@ -1,51 +1,64 @@
-### Local dev
+# Data Retention Offloader
+
+A complete archival pipeline to offload aged tables from relational databases to an Iceberg-backed data lake using AWS Glue, Airflow (MWAA), and Lambda.
+
+## Project Structure
+
+
+## What It Does
+
+- Discovers tables in source databases that match a retention policy.
+- Offloads tables to Iceberg format using AWS Glue with full lineage.
+- Automates orchestration via Apache Airflow running on MWAA.
+- Supports onboarding of new databases via simple YAML config.
+- Deployable via a single script (`scripts/deploy.sh`).
+
+## Components
+
+### 1. Glue Job
+
+- Script: `glue_jobs/archive_table.py`
+- Copies tables to Iceberg format in S3.
+- Uses JDBC connection and Secrets Manager for authentication.
+- Automatically creates Glue metadata (catalog, database, tables).
+
+### 2. Airflow DAG
+
+- File: `airflow/dags/archive_tables.py`
+- Discovers eligible tables and launches per-table offload Glue jobs.
+
+### 3. Lambda Functions
+
+- `discover_tables_lambda`: Finds archival candidates and triggers DAG runs.
+- `s3_yaml_to_mwaa`: Triggers DAGs on YAML upload to S3.
+- Both share an IAM role and are packaged using `scripts/deploy_lambda.sh`.
+
+## Deployment
+
+Run the main deployment script:
 
 ```bash
-git clone …
-bash .docker/run_local.sh
+./scripts/deploy.sh
 ```
+
+This will:
+
+- Upload Airflow DAGs to S3
+- Deploy required Lambda functions
+- Set up and upload the Glue job
+- Optionally deploy MWAA infrastructure (can be uncommented in deploy.sh)
+
+## Onboard a New Database
+Use the following script to register a new JDBC database:
 
 ```bash
-docker run --rm -it \
-  --network docker_default \
-  -e MC_HOST_local="http://minio:minio123@minio:9000" \
-  minio/mc ls -r local
+./scripts/onboard_database.sh \
+  --connection-name nucleus_dev \
+  --jdbc-url jdbc:postgresql://host:port/db \
+  --subnet-ids "subnet-abc,subnet-def" \
+  --security-group-id sg-xyz
 ```
+This will:
 
-```bash
-docker-compose -f docker/docker-compose.yml exec spark bash -c '       
-cat > /workspace/query_ok.py <<PY                                
-from pyspark.sql import SparkSession                               
-  
-spark = (                           
-    SparkSession.builder            
-      .appName("query-ok")   
-      .config("spark.sql.catalog.local",  "org.apache.iceberg.spark.SparkCatalog")
-      .config("spark.sql.catalog.local.type", "hadoop")                       
-      .config("spark.sql.catalog.local.warehouse", "s3a://lakehouse/dev")
-      .config("spark.sql.catalog.default", "local")                   
-      .config("spark.hadoop.fs.s3a.endpoint",        "http://minio:9000")
-      .config("spark.hadoop.fs.s3a.access.key",      "minio")  
-      .config("spark.hadoop.fs.s3a.secret.key",      "minio123")
-      .config("spark.hadoop.fs.s3a.path.style.access","true")
-      .config("spark.hadoop.fs.s3a.connection.ssl.enabled","false")
-      .getOrCreate()                                             
-)                                                                         
-
-spark.sql("SHOW TABLES IN local.dev_public").show()
-spark.read.table("local.dev_public.sample_submission_librarytype").show(5)
-spark.stop()
-PY
-
-spark-submit \
-  --master local[*] \
-  --jars /workspace/jars/iceberg-spark-runtime-3.4_2.12-1.5.0.jar \
-  /workspace/query_ok.py
-'
-```
-
-### Deploy
-
-1. Zip repo & upload to S3
-2. Create Glue Spark jobs (bulk_offload, retain_cleanup)
-3. Pass `--env=prod --config=s3://bucket/conf/offload.yaml`
+- Create a secret in AWS Secrets Manager for DB credentials
+- Create or update a Glue connection with VPC and networking details
