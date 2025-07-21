@@ -8,7 +8,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 # --- Shared Settings ---
-BUCKET="bitbio-airflow"
+BUCKET="{s3_asset_bucket}"
 
 # Convenience
 DEPLOY_LAMBDA="$REPO_ROOT/scripts/deploy_lambda.sh"

@@ -1,0 +1,26 @@
+iceberg_warehouse: s3://my-bucket-99433/iceberg_warehouse/archived_data/
+
+targets:
+  - name: mysql_purge
+    iceberg_database: mysql_database
+    iceberg_table_name: leads_iceberg
+    retention_expiry_column: retention_expiry_date
+    legal_hold_column: legal_hold
+
+  - name: postgres_purge
+    iceberg_database: postgres_database
+    iceberg_table_name: leads_iceberg
+    retention_expiry_column: retention_expiry_date
+    legal_hold_column: legal_hold
+
+  - name: sqlserver_purge
+    iceberg_database: sqlserver_database
+    iceberg_table_name: leads_iceberg
+    retention_expiry_column: retention_expiry_date
+    legal_hold_column: legal_hold
+
+  - name: oracel_purge
+    iceberg_database: orcl
+    iceberg_table_name: leads_iceberg
+    retention_expiry_column: retention_expiry_date
+    legal_hold_column: legal_hold

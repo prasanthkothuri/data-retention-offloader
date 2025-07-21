@@ -13,15 +13,15 @@ NAT_GW_ID="nat-0f7e32d5f639b83e0"          # existing NAT gateway (public subnet
 # Private subnet definitions (CIDRs must not overlap anything else in the VPC)
 SUBNET_AZ_A="eu-west-2a"
 SUBNET_A_CIDR="172.31.128.0/24"
-SUBNET_NAME_A="bitbio-private-a"
+SUBNET_NAME_A="private-a"
 
 SUBNET_AZ_B="eu-west-2b"
 SUBNET_B_CIDR="172.31.129.0/24"
-SUBNET_NAME_B="bitbio-private-b"
+SUBNET_NAME_B="private-b"
 
 # MWAA / S3 / IAM parameters
-S3_BUCKET="bitbio-airflow"
-ENV_NAME="bitbio-archival-dev"
+S3_BUCKET="{s3_asset_bucket}"
+ENV_NAME="archival-dev"
 EXEC_ROLE_NAME="${ENV_NAME}-exec-role"
 SG_NAME="${ENV_NAME}-sg"
 AIRFLOW_VERSION="2.8.1"
@@ -140,7 +140,7 @@ if [[ "$SUBNET_ID_B" == "none" || "$SUBNET_ID_B" == "None" ]]; then
 fi
 
 # Route table (one per pair of private subnets is fine)
-RT_NAME="bitbio-private-rt"
+RT_NAME="private-rt"
 RT_ID=$($AWS ec2 describe-route-tables \
           --filters "Name=tag:Name,Values=$RT_NAME" "Name=vpc-id,Values=$VPC_ID" \
           --query 'RouteTables[0].RouteTableId' --output text 2>/dev/null || echo "none")

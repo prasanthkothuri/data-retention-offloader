@@ -4,19 +4,20 @@ set -euo pipefail
 ###############################################################################
 # Configuration
 ###############################################################################
-AWS_REGION="eu-west-2"
+AWS_REGION="eu-west-1"
 
 # Buckets
-S3_ASSET_BUCKET="bitbio-airflow"
-S3_WAREHOUSE_BUCKET="bitbio.temp"   # Iceberg warehouse bucket
+S3_ASSET_BUCKET="natwest-data-archive-assets"
+S3_WAREHOUSE_BUCKET="natwest-data-archive-vault"   # Iceberg warehouse bucket
 
 # Glue assets
-GLUE_JOB_NAME="archive-table-to-iceberg"
-GLUE_ROLE_NAME="ilm-glue-archival-role"
-GLUE_CONNECTION_NAME="nucleus_dev"
+GLUE_JOB_NAME="natwest-data-archive-table-to-iceberg"
+GLUE_ROLE_NAME="natwest-data-archive-glue-role"
+GLUE_CONNECTION_NAME="onprem_orcl_conn"
 GLUE_SCRIPT_LOCAL_PATH="glue_jobs/archive_table.py"
 GLUE_SCRIPT_S3_KEY="glue_jobs/archive_table.py"
-REQUIRED_GLUE_VERSION="4.0"
+GLUE_VERSION="5.0"
+MAX_CONCURRENCY=10
 
 ###############################################################################
 # Helpers
@@ -67,14 +68,12 @@ cat >"$TMP_DIR/inline.json" <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
-
     {
       "Sid": "ReadGlueScript",
       "Effect": "Allow",
       "Action": "s3:GetObject",
       "Resource": "arn:aws:s3:::${S3_ASSET_BUCKET}/glue_jobs/*"
     },
-
     {
       "Sid": "WriteSparkLogsTemp",
       "Effect": "Allow",
@@ -84,15 +83,10 @@ cat >"$TMP_DIR/inline.json" <<EOF
         "arn:aws:s3:::${S3_ASSET_BUCKET}/temp/*"
       ]
     },
-
     {
       "Sid": "IcebergDataRW",
       "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject"
-      ],
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
       "Resource": "arn:aws:s3:::${S3_WAREHOUSE_BUCKET}/*"
     },
     {
@@ -101,7 +95,6 @@ cat >"$TMP_DIR/inline.json" <<EOF
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::${S3_WAREHOUSE_BUCKET}"
     },
-
     {
       "Sid": "GlueConnection",
       "Effect": "Allow",
@@ -114,36 +107,25 @@ cat >"$TMP_DIR/inline.json" <<EOF
       "Action": "secretsmanager:GetSecretValue",
       "Resource": "*"
     },
-
     {
       "Sid": "GlueDatabaseOps",
       "Effect": "Allow",
-      "Action": [
-        "glue:GetDatabase",
-        "glue:CreateDatabase"
-      ],
+      "Action": ["glue:GetDatabase", "glue:CreateDatabase"],
       "Resource": [
         "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:catalog",
         "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:database/archive_*"
       ]
     },
-
     {
       "Sid": "GlueTableOps",
       "Effect": "Allow",
-      "Action": [
-        "glue:GetTable",
-        "glue:GetTables",
-        "glue:CreateTable",
-        "glue:UpdateTable"
-      ],
+      "Action": ["glue:GetTable", "glue:GetTables", "glue:CreateTable", "glue:UpdateTable"],
       "Resource": [
         "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:table/archive_*/*",
         "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:database/archive_*",
         "arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:catalog"
       ]
     },
-
     {
       "Sid": "VpcEniLifecycle",
       "Effect": "Allow",
@@ -178,12 +160,11 @@ echo "Uploading ${GLUE_SCRIPT_LOCAL_PATH} -> ${S3_SCRIPT_PATH}"
 ###############################################################################
 echo "Ensuring Glue job ${GLUE_JOB_NAME} exists/updated ..."
 
-SPARK_CONF="spark.jars.packages=org.postgresql:postgresql:42.7.3,\
-spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog,\
-spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog,\
-spark.sql.catalog.glue_catalog.warehouse=s3://${S3_WAREHOUSE_BUCKET}/iceberg/,\
-spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO,\
-spark.sql.defaultCatalog=glue_catalog"
+SPARK_CONF="spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog \
+--conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog \
+--conf spark.sql.catalog.glue_catalog.warehouse=s3://${S3_WAREHOUSE_BUCKET}/iceberg/ \
+--conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO \
+--conf spark.sql.defaultCatalog=glue_catalog"
 
 JOB_COMMAND=$(cat <<EOF
 {
@@ -196,15 +177,17 @@ EOF
 
 DEFAULT_ARGUMENTS=$(cat <<EOF
 {
-  "--datalake-formats": "iceberg",
+  "--job-language": "python",
+  "--disable-proxy-v2": "true",
   "--enable-glue-datacatalog": "true",
   "--enable-metrics": "true",
   "--enable-spark-ui": "true",
   "--spark-event-logs-path": "s3://${S3_ASSET_BUCKET}/spark-history/",
-  "--job-language": "python",
   "--TempDir": "s3://${S3_ASSET_BUCKET}/temp/",
-  "--conf": "$SPARK_CONF",
-  "--user-jars-first": "true"
+  "--spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+  "--packages": "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.9.1",
+  "--extra-jars": "s3://${S3_ASSET_BUCKET}/glue_jobs/ojdbc8.jar",
+  "--conf": "$SPARK_CONF"
 }
 EOF
 )
@@ -219,9 +202,10 @@ if ! "${AWS_CMD[@]}" glue get-job --job-name "$GLUE_JOB_NAME" >/dev/null 2>&1; t
     --command "$JOB_COMMAND" \
     --default-arguments "$DEFAULT_ARGUMENTS" \
     --execution-property "$EXECUTION_PROPERTY" \
-    --glue-version "$REQUIRED_GLUE_VERSION" \
+    --glue-version "$GLUE_VERSION" \
     --worker-type "G.1X" \
-    --number-of-workers 5 \
+    --number-of-workers 2 \
+    --max-concurrent-runs  $MAX_CONCURRENCY \
     --connections "$CONNECTIONS_ARG" >/dev/null
   echo "Glue job created."
 else
@@ -232,9 +216,9 @@ else
       \"Command\": $JOB_COMMAND,
       \"DefaultArguments\": $DEFAULT_ARGUMENTS,
       \"ExecutionProperty\": $EXECUTION_PROPERTY,
-      \"GlueVersion\": \"$REQUIRED_GLUE_VERSION\",
+      \"GlueVersion\": \"$GLUE_VERSION\",
       \"WorkerType\": \"G.1X\",
-      \"NumberOfWorkers\": 5,
+      \"NumberOfWorkers\": 2,
       \"Connections\": $CONNECTIONS_ARG
     }" >/dev/null
   echo "Glue job updated."
