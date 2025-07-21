@@ -16,25 +16,34 @@ def main():
     """
     Main function for Glue job that handles both discovery and delete modes
     """
-    # Get job arguments
-    args = getResolvedOptions(sys.argv, [
+    # Get basic arguments first
+    basic_args = getResolvedOptions(sys.argv, [
         'mode',
         'source_name', 
         'connection',
-        'iceberg_database',
-        'max_parallel_tables'
+        'iceberg_database'
     ])
     
-    mode = args['mode']
-    source_name = args['source_name']
-    connection = args['connection']
-    iceberg_database = args['iceberg_database']
-    max_parallel_tables = int(args.get('max_parallel_tables', 5))
+    mode = basic_args['mode']
+    source_name = basic_args['source_name']
+    connection = basic_args['connection']
+    iceberg_database = basic_args['iceberg_database']
+    
+    # Get max_parallel_tables only for delete mode
+    max_parallel_tables = 5  # Default value
+    if mode == 'delete':
+        try:
+            delete_args = getResolvedOptions(sys.argv, ['max_parallel_tables'])
+            max_parallel_tables = int(delete_args['max_parallel_tables'])
+        except:
+            logger.warning("max_parallel_tables not provided for delete mode, using default: 5")
     
     logger.info(f"Starting Glue job in {mode} mode")
     logger.info(f"Source: {source_name}")
     logger.info(f"Connection: {connection}")
     logger.info(f"Iceberg Database: {iceberg_database}")
+    if mode == 'delete':
+        logger.info(f"Max Parallel Tables: {max_parallel_tables}")
     
     # Initialize Spark session
     spark = SparkSession.builder \
@@ -187,7 +196,7 @@ def run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables):
                 "timestamp": datetime.now().isoformat()
             }
             
-            logger.info(f"Successfully purged table {table_name}. Remaining expired rows: {remaining_count}")
+            logger.info(f"✅ Successfully purged table {table_name}. Remaining expired rows: {remaining_count}")
             return result
             
         except Exception as e:
@@ -197,7 +206,7 @@ def run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables):
                 "error": str(e),
                 "timestamp": datetime.now().isoformat()
             }
-            logger.error(f"Failed to purge table {table_name}: {str(e)}")
+            logger.error(f"❌ Failed to purge table {table_name}: {str(e)}")
             return error_result
     
     # Use Spark's parallelism to process tables
