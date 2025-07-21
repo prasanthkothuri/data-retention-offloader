@@ -15,6 +15,7 @@ import boto3
 DISCOVER_LAMBDA_FUNCTION_NAME = "natwest_data_archive_discover_tables"
 ARCHIVE_GLUE_JOB_NAME = "natwest-data-archive-table-to-iceberg"
 ASSUME_ROLE_ARN = "arn:aws:iam::934336705194:role/DOC-Airflow-role-dev"
+DYNAMODB_TABLE_NAME = "natwest-archival-configs"
 
 # --- Create a dedicated helper function for the waiter ---
 def get_glue_job_run_waiter(glue_client):
@@ -124,6 +125,79 @@ def parse_and_validate_config(**context):
 
     print("Configuration validated.")
     context["ti"].xcom_push(key="validated_config", value=conf)
+
+def ensure_dynamodb_table_exists():
+    """Create DynamoDB table if it doesn't exist"""
+    session = get_boto3_session()
+    dynamodb = session.resource('dynamodb')
+
+    try:
+        table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+        table.load()  # This will raise an exception if table doesn't exist
+        print(f"Table {DYNAMODB_TABLE_NAME} already exists")
+        return table
+    except dynamodb.meta.client.exceptions.ResourceNotFoundException:
+        print(f"Creating table {DYNAMODB_TABLE_NAME}...")
+        table = dynamodb.create_table(
+            TableName=DYNAMODB_TABLE_NAME,
+            KeySchema=[
+                {
+                    'AttributeName': 'source_name',
+                    'KeyType': 'HASH'
+                }
+            ],
+            AttributeDefinitions=[
+                {
+                    'AttributeName': 'source_name',
+                    'AttributeType': 'S'
+                }
+            ],
+            BillingMode='PAY_PER_REQUEST'
+        )
+
+        # Wait for table to be created
+        table.wait_until_exists()
+        print(f"Table {DYNAMODB_TABLE_NAME} created successfully")
+        return table
+
+def store_config_in_dynamodb(**context):
+    """
+    Store the validated configuration in DynamoDB for future retrieval by purge DAG.
+    """
+    print("--- Starting DynamoDB config storage ---")
+    # Ensure table exists first
+    table = ensure_dynamodb_table_exists()
+
+    # Get validated config and DAG run info
+    ti = context["ti"]
+    conf = ti.xcom_pull(task_ids="parse_and_validate_config", key="validated_config")
+    dag_run_id = context["dag_run"].run_id
+
+    # Extract source name from config
+    source_name = conf['sources'][0]['name']
+    env = conf.get('env', 'dev')
+
+    try:
+        # Store config with source_name as partition key
+        table.put_item(
+            Item={
+                'source_name': source_name,                    # Partition Key
+                'env': env,
+                'dag_run_id': dag_run_id,
+                'archival_date': datetime.now().isoformat(),
+                'config': conf
+            }
+        )
+
+        print(f"Config successfully stored in DynamoDB:")
+        print(f"Source: {source_name}")
+        print(f"Environment: {env}")
+        print(f"DAG Run ID: {dag_run_id}")
+        print(f"Table: {DYNAMODB_TABLE_NAME}")
+
+    except Exception as e:
+        print(f"Failed to store config in DynamoDB: {str(e)}")
+        raise AirflowException(f"DynamoDB storage failed: {str(e)}")
 
 def invoke_discover_lambda(**context):
     session = get_boto3_session()
@@ -237,6 +311,11 @@ with DAG(
         python_callable=parse_and_validate_config,
     )
 
+    store_config = PythonOperator(
+        task_id="store_config_in_dynamodb",
+        python_callable=store_config_in_dynamodb,
+    )
+
     discover_tables_to_archive = PythonOperator(
         task_id="discover_tables_to_archive",
         python_callable=invoke_discover_lambda,
@@ -251,4 +330,4 @@ with DAG(
         script_args=prepare_args.output
     )
 
-    print_raw_config >> validate_config >> discover_tables_to_archive >> prepare_args >> run_archive_jobs
+    print_raw_config >> validate_config >> store_config >> discover_tables_to_archive >> prepare_args >> run_archive_jobs
