@@ -1,6 +1,4 @@
-iceberg_warehouse: s3://my-bucket-99433/iceberg_warehouse/archived_data/
-
 targets:
-  - name: oracel_purge
-    retention_expiry_column: retention_expiry_date
-    legal_hold_column: legal_hold
+  - source_name: on_prem_orcl
+    connection: onprem_orcl_conn
+

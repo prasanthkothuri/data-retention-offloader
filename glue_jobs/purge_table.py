@@ -1,107 +1,264 @@
 import sys
-from datetime import datetime
+import json
+import boto3
+from datetime import datetime, date
 from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
 from pyspark.sql import SparkSession
-from awsglue.context import GlueContext
-from awsglue.job import Job
+from pyspark.context import SparkContext
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 
-# ----------------------------------
-# Read job parameters
-# ----------------------------------
-args = getResolvedOptions(sys.argv, [
-    'database',
-    'table',
-    'retention_expiry_column',
-    'legal_hold_column',
-    'iceberg_warehouse'
-])
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-database = args['database']
-table = args['table']
-retention_col = args['retention_expiry_column']
-legal_hold_col = args['legal_hold_column']
-iceberg_warehouse = args['iceberg_warehouse']
+def main():
+    """
+    Main function for Glue job that handles both discovery and delete modes
+    """
+    # Get job arguments
+    args = getResolvedOptions(sys.argv, [
+        'mode',
+        'source_name', 
+        'connection',
+        'iceberg_database',
+        'max_parallel_tables'
+    ])
+    
+    mode = args['mode']
+    source_name = args['source_name']
+    connection = args['connection']
+    iceberg_database = args['iceberg_database']
+    max_parallel_tables = int(args.get('max_parallel_tables', 5))
+    
+    logger.info(f"Starting Glue job in {mode} mode")
+    logger.info(f"Source: {source_name}")
+    logger.info(f"Connection: {connection}")
+    logger.info(f"Iceberg Database: {iceberg_database}")
+    
+    # Initialize Spark session
+    spark = SparkSession.builder \
+        .appName(f"NatwestDataPurge-{mode}") \
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
+        .config("spark.sql.catalog.glue_catalog.warehouse", "s3://your-iceberg-warehouse/") \
+        .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+        .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
+        .getOrCreate()
+    
+    try:
+        if mode == 'discovery':
+            discovery_results = run_discovery_mode(spark, iceberg_database)
+            save_discovery_results(discovery_results, source_name)
+            
+        elif mode == 'delete':
+            purge_results = run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables)
+            logger.info(f"Purge completed. Results: {purge_results}")
+            
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Supported modes: discovery, delete")
+            
+    except Exception as e:
+        logger.error(f"Error in {mode} mode: {str(e)}")
+        raise
+    finally:
+        spark.stop()
 
-# ----------------------------------
-# Initialize Spark & Glue
-# ----------------------------------
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = SparkSession.builder \
-    .appName("Iceberg Retention Policy Delete Job") \
-    .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-    .config("spark.sql.catalog.glue_catalog.warehouse", iceberg_warehouse) \
-    .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
-    .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
-    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-    .getOrCreate()
+def run_discovery_mode(spark, iceberg_database):
+    """
+    Discovery mode: Find all tables with expired data
+    """
+    logger.info(f"Starting discovery mode for database: {iceberg_database}")
+    
+    try:
+        # Get all tables in the iceberg database
+        tables_df = spark.sql(f"SHOW TABLES IN glue_catalog.{iceberg_database}")
+        table_names = [row['tableName'] for row in tables_df.collect()]
+        
+        logger.info(f"Found {len(table_names)} tables in database {iceberg_database}")
+        
+        tables_with_expired_data = []
+        total_estimated_deletes = 0
+        
+        for table_name in table_names:
+            logger.info(f"Checking table: {table_name}")
+            
+            try:
+                # Check if table has the required columns
+                table_schema = spark.sql(f"DESCRIBE glue_catalog.{iceberg_database}.{table_name}").collect()
+                column_names = [row['col_name'] for row in table_schema]
+                
+                if 'retention_expiry_date' not in column_names or 'legal_hold' not in column_names:
+                    logger.warning(f"Table {table_name} missing required columns (retention_expiry_date, legal_hold). Skipping.")
+                    continue
+                
+                # Count expired rows
+                count_query = f"""
+                SELECT COUNT(*) as expired_count
+                FROM glue_catalog.{iceberg_database}.{table_name}
+                WHERE retention_expiry_date < current_date()
+                AND legal_hold = false
+                """
+                
+                result = spark.sql(count_query).collect()
+                expired_count = result[0]['expired_count']
+                
+                if expired_count > 0:
+                    table_info = {
+                        "iceberg_schema": iceberg_database,
+                        "table_name": table_name,
+                        "estimated_rows_to_delete": expired_count
+                    }
+                    tables_with_expired_data.append(table_info)
+                    total_estimated_deletes += expired_count
+                    
+                    logger.info(f"Table {table_name} has {expired_count} rows to purge")
+                else:
+                    logger.info(f"Table {table_name} has no expired data")
+                    
+            except Exception as e:
+                logger.error(f"Error checking table {table_name}: {str(e)}")
+                continue
+        
+        discovery_results = {
+            "tables_with_data_to_purge": tables_with_expired_data,
+            "total_estimated_deletes": total_estimated_deletes,
+            "discovery_timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+        
+        logger.info(f"Discovery complete. Found {len(tables_with_expired_data)} tables with expired data")
+        logger.info(f"Total estimated rows to delete: {total_estimated_deletes}")
+        
+        return discovery_results
+        
+    except Exception as e:
+        logger.error(f"Error in discovery mode: {str(e)}")
+        raise
 
-job = Job(glueContext)
+def run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables):
+    """
+    Delete mode: Purge expired data from tables
+    """
+    logger.info(f"Starting delete mode for database: {iceberg_database}")
+    
+    # Load discovery results
+    discovery_results = load_discovery_results(source_name)
+    tables_to_purge = discovery_results.get('tables_with_data_to_purge', [])
+    
+    if not tables_to_purge:
+        logger.info("No tables to purge found in discovery results")
+        return {"status": "completed", "tables_processed": 0}
+    
+    logger.info(f"Will purge {len(tables_to_purge)} tables with max parallelism: {max_parallel_tables}")
+    
+    # Use Spark parallelism for table deletions
+    def delete_table_data(table_info):
+        table_name = table_info['table_name']
+        estimated_rows = table_info['estimated_rows_to_delete']
+        
+        try:
+            logger.info(f"Starting deletion for table: {table_name} (estimated {estimated_rows} rows)")
+            
+            delete_query = f"""
+            DELETE FROM glue_catalog.{iceberg_database}.{table_name}
+            WHERE retention_expiry_date < current_date()
+            AND legal_hold = false
+            """
+            
+            # Execute delete
+            spark.sql(delete_query)
+            
+            # Get actual count after deletion (for verification)
+            verify_query = f"""
+            SELECT COUNT(*) as remaining_expired_count
+            FROM glue_catalog.{iceberg_database}.{table_name}
+            WHERE retention_expiry_date < current_date()
+            AND legal_hold = false
+            """
+            
+            remaining_result = spark.sql(verify_query).collect()
+            remaining_count = remaining_result[0]['remaining_expired_count']
+            
+            result = {
+                "table": table_name,
+                "status": "success",
+                "estimated_rows_deleted": estimated_rows,
+                "remaining_expired_rows": remaining_count,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            logger.info(f"Successfully purged table {table_name}. Remaining expired rows: {remaining_count}")
+            return result
+            
+        except Exception as e:
+            error_result = {
+                "table": table_name,
+                "status": "failed",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+            logger.error(f"Failed to purge table {table_name}: {str(e)}")
+            return error_result
+    
+    # Use Spark's parallelism to process tables
+    sc = SparkContext.getOrCreate()
+    tables_rdd = sc.parallelize(tables_to_purge, max_parallel_tables)
+    
+    # Execute deletions in parallel
+    deletion_results = tables_rdd.map(delete_table_data).collect()
+    
+    # Summarize results
+    successful_deletions = [r for r in deletion_results if r['status'] == 'success']
+    failed_deletions = [r for r in deletion_results if r['status'] == 'failed']
+    
+    summary = {
+        "status": "completed",
+        "tables_processed": len(deletion_results),
+        "successful_deletions": len(successful_deletions),
+        "failed_deletions": len(failed_deletions),
+        "results": deletion_results
+    }
+    
+    logger.info(f"Purge summary: {len(successful_deletions)} successful, {len(failed_deletions)} failed")
+    
+    return summary
 
-# ----------------------------------
-# Setup Table and Columns
-# ----------------------------------
-catalog = "glue_catalog"
-full_table_name = f"{catalog}.{database}.{table}"
-retention_col_escaped = f"`{retention_col}`"
-legal_hold_col_escaped = f"`{legal_hold_col}`"
+def save_discovery_results(discovery_results, source_name):
+    """Save discovery results to S3 for later use by delete mode"""
+    try:
+        s3_client = boto3.client('s3')
+        bucket = "natwest-data-archive-vault"  # Use your bucket
+        key = f"purge-temp/{source_name}/discovery-results.json"
+        
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(discovery_results, indent=2),
+            ContentType='application/json'
+        )
+        
+        logger.info(f"Discovery results saved to s3://{bucket}/{key}")
+        
+    except Exception as e:
+        logger.error(f"Error saving discovery results: {str(e)}")
+        raise
 
-# Get today's date
-today = datetime.today().strftime('%Y-%m-%d')
+def load_discovery_results(source_name):
+    """Load discovery results from S3"""
+    try:
+        s3_client = boto3.client('s3')
+        bucket = "natwest-data-archive-vault"  # Use your bucket
+        key = f"purge-temp/{source_name}/discovery-results.json"
+        
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        discovery_results = json.loads(response['Body'].read().decode('utf-8'))
+        
+        logger.info(f"Discovery results loaded from s3://{bucket}/{key}")
+        return discovery_results
+        
+    except Exception as e:
+        logger.error(f"Error loading discovery results: {str(e)}")
+        raise
 
-print(f"[INFO] Starting retention delete job for table: {full_table_name}")
-print(f"[INFO] Current Date: {today}")
-
-# ----------------------------------
-# Step 1: Check Column Existence
-# ----------------------------------
-print(f"[INFO] Checking schema for columns: {retention_col}, {legal_hold_col}")
-schema_df = spark.sql(f"DESCRIBE TABLE {full_table_name}")
-columns = [row['col_name'] for row in schema_df.collect()]
-
-if retention_col not in columns:
-    raise Exception(f"[ERROR] Retention column '{retention_col}' not found in table schema.")
-if legal_hold_col not in columns:
-    raise Exception(f"[ERROR] Legal hold column '{legal_hold_col}' not found in table schema.")
-
-print("[INFO] Required columns found.")
-
-# ----------------------------------
-# Step 2: Build WHERE clause
-# ----------------------------------
-where_clause = f"{legal_hold_col_escaped} = false AND {retention_col_escaped} <= DATE('{today}')"
-
-# ----------------------------------
-# Step 3: Check matching records
-# ----------------------------------
-check_query = f"SELECT COUNT(*) AS match_count FROM {full_table_name} WHERE {where_clause}"
-print(f"[INFO] Executing match check query: {check_query}")
-
-match_count = spark.sql(check_query).collect()[0]["match_count"]
-print(f"[INFO] Matching records for deletion: {match_count}")
-
-if match_count == 0:
-    print("[INFO] No records to delete — job complete.")
-else:
-    print("[INFO] Proceeding to delete records...")
-
-    # ----------------------------------
-    # Step 4: DELETE operation
-    # ----------------------------------
-    delete_query = f"DELETE FROM {full_table_name} WHERE {where_clause}"
-    print(f"[INFO] Executing DELETE query: {delete_query}")
-    spark.sql(delete_query)
-    print("[INFO] Delete operation completed.")
-
-    # ----------------------------------
-    # Step 5: Post-deletion verification
-    # ----------------------------------
-    recheck_count = spark.sql(check_query).collect()[0]["match_count"]
-    if recheck_count == 0:
-        print("[INFO] Verification successful — records have been deleted.")
-    else:
-        print(f"[WARNING] Verification failed — {recheck_count} records still present.")
-
-job.commit()
-print("[INFO] Glue job completed.")
+if __name__ == "__main__":
+    main()

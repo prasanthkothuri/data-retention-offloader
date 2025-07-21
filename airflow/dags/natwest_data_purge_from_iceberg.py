@@ -1,186 +1,270 @@
-# airflow/dags/archive_tables.py
-
 from __future__ import annotations
 
 from airflow import DAG
-from airflow.exceptions import AirflowException
 from airflow.operators.python import PythonOperator
 from airflow.operators.dummy import DummyOperator
-from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
-from airflow.providers.amazon.aws.operators.lambda_function import LambdaInvokeFunctionOperator
+from airflow.decorators import task
+from airflow.exceptions import AirflowException
+from botocore.waiter import WaiterModel, create_waiter_with_client
+from botocore.exceptions import WaiterError
 from datetime import datetime
-import pprint
 import json
+import pprint
+import boto3
 
 # --- Constants ---
-DISCOVER_LAMBDA_FUNCTION_NAME = "archive-discover-tables"
-ARCHIVE_GLUE_JOB_NAME = "archive-table-to-iceberg"
+PURGE_GLUE_JOB_NAME = "natwest-data-purge-from-iceberg"
+ASSUME_ROLE_ARN = "arn:aws:iam::934336705194:role/DOC-Airflow-role-dev"
+
+# --- Create a dedicated helper function for the waiter ---
+def get_glue_job_run_waiter(glue_client):
+    """
+    Creates and returns a custom Boto3 waiter for Glue job run completion.
+    """
+    waiter_name = "JobRunCompleted"
+    waiter_config = {
+        "version": 2,
+        "waiters": {
+            "JobRunCompleted": {
+                "operation": "GetJobRun",
+                "delay": 30,
+                "maxAttempts": 100,
+                "acceptors": [
+                    {
+                        "matcher": "path",
+                        "expected": "SUCCEEDED",
+                        "argument": "JobRun.JobRunState",
+                        "state": "success"
+                    },
+                    {
+                        "matcher": "path",
+                        "expected": "FAILED",
+                        "argument": "JobRun.JobRunState",
+                        "state": "failure"
+                    },
+                    {
+                        "matcher": "path",
+                        "expected": "STOPPED",
+                        "argument": "JobRun.JobRunState",
+                        "state": "failure"
+                    },
+                    {
+                        "matcher": "path",
+                        "expected": "TIMEOUT",
+                        "argument": "JobRun.JobRunState",
+                        "state": "failure"
+                    }
+                ]
+            }
+        }
+    }
+    waiter_model = WaiterModel(waiter_config)
+    return create_waiter_with_client(waiter_name, waiter_model, glue_client)
+
+# --- Cross-account boto3 session ---
+def get_boto3_session():
+    sts = boto3.client(
+        "sts",
+        region_name="eu-west-1",
+        endpoint_url="https://sts.eu-west-1.amazonaws.com"
+        )
+    creds = sts.assume_role(
+        RoleArn=ASSUME_ROLE_ARN,
+        RoleSessionName="airflow-cross-account"
+    )["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+        region_name="eu-west-1"
+    )
 
 # --- Task Functions ---
 
-def print_config(**context):
-    """
-    Print the configuration dict passed in via dag_run.conf.
-    """
+def print_purge_config(**context):
+    """Print the purge configuration"""
     conf = context["dag_run"].conf or {}
-    print("=== RAW CONF dict ===")
+    print("=== PURGE CONFIG ===")
     pprint.pprint(conf)
-
     if conf:
         print("=== JSON SERIALIZED ===")
         print(json.dumps(conf, indent=2))
     else:
         print("No configuration received in dag_run.conf")
 
-def parse_and_validate_config(**context):
-    """
-    Validates the config schema and naming conventions.
-    Pushes the validated config to XComs for downstream tasks.
-    """
-    print("--- Starting configuration validation ---")
+def parse_and_validate_purge_config(**context):
+    """Validate purge configuration and extract target info"""
+    print("--- Starting purge configuration validation ---")
     conf = context["dag_run"].conf
     if not conf:
         raise AirflowException("Configuration is empty. Cannot proceed.")
 
-    required_keys = ["env", "warehouses", "connections", "sources", "retention_policies"]
+    if 'targets' not in conf:
+        raise AirflowException("Configuration missing 'targets' section")
+    
+    targets = conf['targets']
+    if not targets or len(targets) == 0:
+        raise AirflowException("No targets specified in configuration")
+    
+    # For now, support single target
+    target = targets[0]
+    
+    required_keys = ["source_name", "connection"]
     for key in required_keys:
-        if key not in conf:
-            raise AirflowException(f"Validation failed: Required top-level key '{key}' is missing.")
+        if key not in target:
+            raise AirflowException(f"Target missing required key: '{key}'")
     
-    env_suffix = f"_{conf['env']}"
+    source_name = target['source_name']
+    connection = target['connection']
+    iceberg_database = f"archive_{connection}"
     
-    for conn_name in conf["connections"]:
-        if not conn_name.endswith(env_suffix):
-            raise AirflowException(
-                f"Validation failed: Connection '{conn_name}' does not have the required '{env_suffix}' suffix."
-            )
+    print(f"Validated purge target:")
+    print(f"  Source Name: {source_name}")
+    print(f"  Connection: {connection}")
+    print(f"  Iceberg Database: {iceberg_database}")
+    
+    # Store in XCom for downstream tasks
+    context["ti"].xcom_push(key="source_name", value=source_name)
+    context["ti"].xcom_push(key="connection", value=connection)
+    context["ti"].xcom_push(key="iceberg_database", value=iceberg_database)
+    context["ti"].xcom_push(key="target_config", value=target)
 
-    for i, source in enumerate(conf["sources"]):
-        warehouse_ref = source.get("warehouse")
-        if not warehouse_ref or warehouse_ref not in conf["warehouses"]:
-            raise AirflowException(f"Validation failed for source #{i}: warehouse '{warehouse_ref}' not found in warehouses block.")
-
-        connection_ref = source.get("connection")
-        if not connection_ref or connection_ref not in conf["connections"]:
-            raise AirflowException(f"Validation failed for source #{i}: connection '{connection_ref}' not found in connections block.")
-
-    print("Configuration is valid.")
-    context["ti"].xcom_push(key="validated_config", value=conf)
-
-def prepare_glue_job_args(**context):
-    """
-    Takes the list of discovered tables and prepares a list of dictionaries
-    formatted for the .expand_kwargs() method. This function now returns
-    the list directly, which is the standard pattern for dynamic tasks.
-    """
-    print("--- Preparing arguments for Glue jobs ---")
+def run_discovery_glue_job(**context):
+    """Run Glue job in discovery mode to find tables with expired data"""
+    print("--- Starting Discovery Glue Job ---")
+    
     ti = context["ti"]
+    source_name = ti.xcom_pull(task_ids="parse_and_validate_purge_config", key="source_name")
+    connection = ti.xcom_pull(task_ids="parse_and_validate_purge_config", key="connection")
+    iceberg_database = ti.xcom_pull(task_ids="parse_and_validate_purge_config", key="iceberg_database")
     
-    # Pull the JSON string payload from the Lambda task's XCom
-    lambda_payload_str = ti.xcom_pull(task_ids='discover_tables_to_purge', key='return_value')
+    session = get_boto3_session()
+    glue = session.client("glue")
     
-    if not lambda_payload_str:
-        print("Received empty payload from Lambda. Nothing to prepare.")
-        return []
+    # Prepare arguments for discovery mode
+    script_args = {
+        "--mode": "discovery",
+        "--source_name": source_name,
+        "--connection": connection,
+        "--iceberg_database": iceberg_database
+    }
+    
+    print("Running Discovery Glue job with args:")
+    pprint.pprint(script_args)
+    
+    response = glue.start_job_run(
+        JobName=PURGE_GLUE_JOB_NAME,
+        Arguments=script_args
+    )
+    
+    job_run_id = response["JobRunId"]
+    print(f"Started Discovery Glue job. Run ID: {job_run_id}")
 
-    # --- CORRECTED CODE: Parse the JSON string into a Python dictionary ---
-    print(f"Received payload string: {lambda_payload_str}")
-    lambda_payload = json.loads(lambda_payload_str)
+    # Wait for completion using custom waiter
+    custom_waiter = get_glue_job_run_waiter(glue)
     
-    discovered_tables = lambda_payload.get("discovered_tables", [])
-    
-    if not discovered_tables:
-        print("No new tables to purge. Nothing to prepare.")
-        return []
+    print("Waiting for Discovery Glue job to complete...")
+    try:
+        custom_waiter.wait(JobName=PURGE_GLUE_JOB_NAME, RunId=job_run_id)
+        print("Discovery Glue job succeeded.")
+        
+        # Store job run ID for later reference
+        context["ti"].xcom_push(key="discovery_job_run_id", value=job_run_id)
+        
+    except WaiterError as e:
+        print(f"Waiter failed: {e}")
+        status_response = glue.get_job_run(JobName=PURGE_GLUE_JOB_NAME, RunId=job_run_id)
+        job_status = status_response["JobRun"]["JobRunState"]
+        error_message = status_response["JobRun"].get("ErrorMessage", "No error message provided.")
+        raise AirflowException(f"Discovery Glue job failed with status '{job_status}'. Error: {error_message}")
 
-    print(f"Preparing arguments for {len(discovered_tables)} tables.")
+def run_purge_glue_job(**context):
+    """Run Glue job in delete mode to purge expired data"""
+    print("--- Starting Purge Glue Job ---")
     
-    config = ti.xcom_pull(task_ids='parse_and_validate_config', key='validated_config')
-    source_config = config['sources'][0]
+    ti = context["ti"]
+    source_name = ti.xcom_pull(task_ids="parse_and_validate_purge_config", key="source_name")
+    connection = ti.xcom_pull(task_ids="parse_and_validate_purge_config", key="connection")
+    iceberg_database = ti.xcom_pull(task_ids="parse_and_validate_purge_config", key="iceberg_database")
+    target_config = ti.xcom_pull(task_ids="parse_and_validate_purge_config", key="target_config")
     
-    glue_job_kwargs_list = []
+    session = get_boto3_session()
+    glue = session.client("glue")
     
-    for table_info in discovered_tables:
-        schema = table_info["schema"]
-        table = table_info["table"]
-        
-        warehouse_name = source_config['warehouse']
-        warehouse_path = config['warehouses'][warehouse_name]
-        connection_name = source_config['connection']
-        retention_policy_name = source_config['retention_policy']
-        retention_policy_value = config['retention_policies'][retention_policy_name]
-        
-        target_glue_db = f"archive_{connection_name}"
-        target_glue_table = f"{schema}_{table}"
-        target_s3_path = f"{warehouse_path.rstrip('/')}/{connection_name}/{schema}/{table}/"
-        
-        script_args = {
-            "--source_schema": schema,
-            "--source_table": table,
-            "--glue_connection_name": config['connections'][connection_name],
-            "--target_s3_path": target_s3_path,
-            "--target_glue_db": target_glue_db,
-            "--target_glue_table": target_glue_table,
-            "--retention_policy_value": retention_policy_value,
-        }
-        
-        glue_job_kwargs_list.append({"script_args": script_args})
-        
-    print("Successfully prepared all Glue job arguments.")
-    pprint.pprint(glue_job_kwargs_list)
+    # Prepare arguments for delete mode
+    script_args = {
+        "--mode": "delete",
+        "--source_name": source_name,
+        "--connection": connection,
+        "--iceberg_database": iceberg_database,
+        "--max_parallel_tables": str(target_config.get("max_parallel_tables", 5))
+    }
     
-    return glue_job_kwargs_list
+    print("Running Purge Glue job with args:")
+    pprint.pprint(script_args)
+    
+    response = glue.start_job_run(
+        JobName=PURGE_GLUE_JOB_NAME,
+        Arguments=script_args
+    )
+    
+    job_run_id = response["JobRunId"]
+    print(f"Started Purge Glue job. Run ID: {job_run_id}")
 
+    # Wait for completion using custom waiter
+    custom_waiter = get_glue_job_run_waiter(glue)
+    
+    print("Waiting for Purge Glue job to complete...")
+    try:
+        custom_waiter.wait(JobName=PURGE_GLUE_JOB_NAME, RunId=job_run_id)
+        print("Purge Glue job succeeded.")
+        
+    except WaiterError as e:
+        print(f"Waiter failed: {e}")
+        status_response = glue.get_job_run(JobName=PURGE_GLUE_JOB_NAME, RunId=job_run_id)
+        job_status = status_response["JobRun"]["JobRunState"]
+        error_message = status_response["JobRun"].get("ErrorMessage", "No error message provided.")
+        raise AirflowException(f"Purge Glue job failed with status '{job_status}'. Error: {error_message}")
 
 # --- DAG Definition ---
 
 default_args = {
-    "owner": "bitbio",
+    "owner": "natwest",
     "start_date": datetime(2025, 1, 1),
 }
 
 with DAG(
-    dag_id="archive_tables",
+    dag_id="natwest_data_purge_from_iceberg",
     default_args=default_args,
     schedule_interval=None,
     catchup=False,
-    tags=["archival", "triggered"],
+    tags=["purge", "iceberg", "triggered"],
 ) as dag:
 
-    print_raw_config = PythonOperator(
-        task_id="print_config",
-        python_callable=print_config,
+    print_config = PythonOperator(
+        task_id="print_purge_config",
+        python_callable=print_purge_config,
     )
 
     validate_config = PythonOperator(
-        task_id="parse_and_validate_config",
-        python_callable=parse_and_validate_config,
+        task_id="parse_and_validate_purge_config",
+        python_callable=parse_and_validate_purge_config,
     )
 
-    discover_tables_to_purge = LambdaInvokeFunctionOperator(
+    discover_tables_to_purge = PythonOperator(
         task_id="discover_tables_to_purge",
-        function_name=DISCOVER_LAMBDA_FUNCTION_NAME,
-        payload="{{ task_instance.xcom_pull(task_ids='parse_and_validate_config', key='validated_config')['sources'][0] | tojson }}"
+        python_callable=run_discovery_glue_job,
     )
 
-    # Manual approval checkpoint - user will review discovered tables and approve
+    # Manual approval checkpoint
     approval_checkpoint = DummyOperator(
         task_id="review_and_approve_purge",
     )
 
-    prepare_args = PythonOperator(
-        task_id="prepare_glue_job_args",
-        python_callable=prepare_glue_job_args,
+    execute_purge = PythonOperator(
+        task_id="execute_purge_operations",
+        python_callable=run_purge_glue_job,
     )
 
-    run_purge_job = GlueJobOperator.partial(
-        task_id="run_purge_glue_job",
-        job_name=ARCHIVE_GLUE_JOB_NAME,
-        wait_for_completion=True,
-    ).expand_kwargs(
-        prepare_args.output
-    )
-
-    # Set the task dependency chain with approval checkpoint
-    print_raw_config >> validate_config >> discover_tables_to_purge >> approval_checkpoint >> prepare_args >> run_purge_job
-    
+    # Task dependencies
+    print_config >> validate_config >> discover_tables_to_purge >> approval_checkpoint >> execute_purge
