@@ -50,15 +50,14 @@ def main():
         .appName(f"NatwestDataPurge-{mode}") \
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
         .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.warehouse", "s3://your-iceberg-warehouse/") \
+        .config("spark.sql.catalog.glue_catalog.warehouse", "s3://natwest-data-archive-vault/iceberg/") \
         .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
         .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
         .getOrCreate()
     
     try:
         if mode == 'discovery':
-            discovery_results = run_discovery_mode(spark, iceberg_database)
-            save_discovery_results(discovery_results, source_name)
+            discovery_results = run_discovery_mode(spark, iceberg_database, source_name)
             
         elif mode == 'delete':
             purge_results = run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables)
@@ -73,7 +72,7 @@ def main():
     finally:
         spark.stop()
 
-def run_discovery_mode(spark, iceberg_database):
+def run_discovery_mode(spark, iceberg_database, source_name):
     """
     Discovery mode: Find all tables with expired data
     """
@@ -135,8 +134,23 @@ def run_discovery_mode(spark, iceberg_database):
             "discovery_timestamp": datetime.utcnow().isoformat() + "Z"
         }
         
-        logger.info(f"Discovery complete. Found {len(tables_with_expired_data)} tables with expired data")
+        # Save to S3 for delete job to read later
+        save_discovery_results(discovery_results, source_name)
+        
+        # Log detailed summary for user review
+        logger.info("=== DISCOVERY SUMMARY ===")
+        logger.info(f"Tables scanned: {len(table_names)}")
+        logger.info(f"Tables with expired data: {len(tables_with_expired_data)}")
         logger.info(f"Total estimated rows to delete: {total_estimated_deletes}")
+        
+        if tables_with_expired_data:
+            logger.info("Tables requiring purge:")
+            for table in tables_with_expired_data:
+                logger.info(f"  - {table['table_name']}: {table['estimated_rows_to_delete']} rows")
+        else:
+            logger.info("No tables require purging - all data is within retention period")
+        
+        logger.info("=== END DISCOVERY SUMMARY ===")
         
         return discovery_results
         
@@ -150,7 +164,7 @@ def run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables):
     """
     logger.info(f"Starting delete mode for database: {iceberg_database}")
     
-    # Load discovery results
+    # Load discovery results from S3
     discovery_results = load_discovery_results(source_name)
     tables_to_purge = discovery_results.get('tables_with_data_to_purge', [])
     
@@ -196,7 +210,7 @@ def run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables):
                 "timestamp": datetime.now().isoformat()
             }
             
-            logger.info(f"✅ Successfully purged table {table_name}. Remaining expired rows: {remaining_count}")
+            logger.info(f"Successfully purged table {table_name}. Remaining expired rows: {remaining_count}")
             return result
             
         except Exception as e:
@@ -206,7 +220,7 @@ def run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables):
                 "error": str(e),
                 "timestamp": datetime.now().isoformat()
             }
-            logger.error(f"❌ Failed to purge table {table_name}: {str(e)}")
+            logger.error(f"Failed to purge table {table_name}: {str(e)}")
             return error_result
     
     # Use Spark's parallelism to process tables
@@ -228,7 +242,22 @@ def run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables):
         "results": deletion_results
     }
     
-    logger.info(f"Purge summary: {len(successful_deletions)} successful, {len(failed_deletions)} failed")
+    logger.info("=== PURGE SUMMARY ===")
+    logger.info(f"Tables processed: {len(deletion_results)}")
+    logger.info(f"Successful deletions: {len(successful_deletions)}")
+    logger.info(f"Failed deletions: {len(failed_deletions)}")
+    
+    if successful_deletions:
+        logger.info("Successfully purged tables:")
+        for result in successful_deletions:
+            logger.info(f"  - {result['table']}: {result['estimated_rows_deleted']} rows deleted")
+    
+    if failed_deletions:
+        logger.error("Failed to purge tables:")
+        for result in failed_deletions:
+            logger.error(f"  - {result['table']}: {result['error']}")
+    
+    logger.info("=== END PURGE SUMMARY ===")
     
     return summary
 
@@ -236,7 +265,7 @@ def save_discovery_results(discovery_results, source_name):
     """Save discovery results to S3 for later use by delete mode"""
     try:
         s3_client = boto3.client('s3')
-        bucket = "natwest-data-archive-vault"  # Use your bucket
+        bucket = "natwest-data-archive-vault"
         key = f"purge-temp/{source_name}/discovery-results.json"
         
         s3_client.put_object(
@@ -256,7 +285,7 @@ def load_discovery_results(source_name):
     """Load discovery results from S3"""
     try:
         s3_client = boto3.client('s3')
-        bucket = "natwest-data-archive-vault"  # Use your bucket
+        bucket = "natwest-data-archive-vault"
         key = f"purge-temp/{source_name}/discovery-results.json"
         
         response = s3_client.get_object(Bucket=bucket, Key=key)

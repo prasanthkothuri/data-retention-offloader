@@ -176,44 +176,6 @@ def run_discovery_glue_job(**context):
         error_message = status_response["JobRun"].get("ErrorMessage", "No error message provided.")
         raise AirflowException(f"Discovery Glue job failed with status '{job_status}'. Error: {error_message}")
 
-def check_if_purge_needed(**context):
-    """
-    Check discovery results and decide whether to proceed with approval/purge or skip
-    """
-    print("--- Checking if purge is needed ---")
-    
-    ti = context["ti"]
-    source_name = ti.xcom_pull(task_ids="parse_and_validate_purge_config", key="source_name")
-    
-    # For now, we'll need to read the discovery results from S3
-    # (In a real implementation, you'd read the Glue job output)
-    
-    session = get_boto3_session()
-    s3_client = session.client('s3')
-    bucket = "natwest-data-archive-vault"
-    key = f"purge-temp/{source_name}/discovery-results.json"
-    
-    try:
-        response = s3_client.get_object(Bucket=bucket, Key=key)
-        discovery_results = json.loads(response['Body'].read().decode('utf-8'))
-        
-        total_deletes = discovery_results.get('total_estimated_deletes', 0)
-        tables_count = len(discovery_results.get('tables_with_data_to_purge', []))
-        
-        print(f"Discovery results: {tables_count} tables, {total_deletes} total rows to delete")
-        
-        if total_deletes == 0:
-            print("No expired data found. Skipping approval and purge steps.")
-            return "purge_not_needed"
-        else:
-            print(f"Found {total_deletes} rows to delete. Proceeding to approval.")
-            return "approval_checkpoint"
-            
-    except Exception as e:
-        print(f"Error reading discovery results: {str(e)}")
-        print("Defaulting to approval process for safety")
-        return "approval_checkpoint"
-
 def purge_not_needed(**context):
     """
     Task to execute when no purge is needed
@@ -230,6 +192,8 @@ def purge_not_needed(**context):
     print("  - Action taken: None required")
     
     return "No purge needed - retention policies are working correctly"
+
+def run_purge_glue_job(**context):
     """Run Glue job in delete mode to purge expired data"""
     print("--- Starting Purge Glue Job ---")
     
@@ -275,7 +239,7 @@ def purge_not_needed(**context):
         status_response = glue.get_job_run(JobName=PURGE_GLUE_JOB_NAME, RunId=job_run_id)
         job_status = status_response["JobRun"]["JobRunState"]
         error_message = status_response["JobRun"].get("ErrorMessage", "No error message provided.")
-def run_purge_glue_job(**context):
+        raise AirflowException(f"Purge Glue job failed with status '{job_status}'. Error: {error_message}")
 
 # --- DAG Definition ---
 
@@ -307,19 +271,7 @@ with DAG(
         python_callable=run_discovery_glue_job,
     )
 
-    # Decision point: check if purge is needed
-    check_purge_needed = BranchPythonOperator(
-        task_id="check_if_purge_needed",
-        python_callable=check_if_purge_needed,
-    )
-
-    # Path 1: No purge needed
-    purge_not_needed_task = PythonOperator(
-        task_id="purge_not_needed",
-        python_callable=purge_not_needed,
-    )
-
-    # Path 2: Purge needed - manual approval
+    # Manual approval checkpoint
     approval_checkpoint = DummyOperator(
         task_id="approval_checkpoint",
     )
@@ -329,9 +281,5 @@ with DAG(
         python_callable=run_purge_glue_job,
     )
 
-    # Task dependencies
-    print_config >> validate_config >> discover_tables_to_purge >> check_purge_needed
-    
-    # Branching paths
-    check_purge_needed >> purge_not_needed_task
-    check_purge_needed >> approval_checkpoint >> execute_purge
+    # Simple linear flow - always go to approval
+    print_config >> validate_config >> discover_tables_to_purge  >> approval_checkpoint >> execute_purge
