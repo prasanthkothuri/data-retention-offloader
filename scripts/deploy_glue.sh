@@ -192,7 +192,7 @@ DEFAULT_ARGUMENTS=$(cat <<EOF
 EOF
 )
 
-EXECUTION_PROPERTY='{"MaxConcurrentRuns": 50}'
+EXECUTION_PROPERTY='{"MaxConcurrentRuns": 10}'
 CONNECTIONS_ARG="{\"Connections\": [\"$GLUE_CONNECTION_NAME\"]}"
 
 if ! "${AWS_CMD[@]}" glue get-job --job-name "$GLUE_JOB_NAME" >/dev/null 2>&1; then
@@ -205,7 +205,6 @@ if ! "${AWS_CMD[@]}" glue get-job --job-name "$GLUE_JOB_NAME" >/dev/null 2>&1; t
     --glue-version "$GLUE_VERSION" \
     --worker-type "G.1X" \
     --number-of-workers 2 \
-    --max-concurrent-runs  $MAX_CONCURRENCY \
     --connections "$CONNECTIONS_ARG" >/dev/null
   echo "Glue job created."
 else

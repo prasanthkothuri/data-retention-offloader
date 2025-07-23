@@ -25,7 +25,14 @@ def create_glue_database_if_not_exists(db_name: str, region: str = "eu-west-1"):
     except ClientError as e:
         if e.response["Error"]["Code"] == "EntityNotFoundException":
             print(f"Glue database '{db_name}' not found. Creating it …")
-            glue.create_database(DatabaseInput={"Name": db_name})
+            try:
+                glue.create_database(DatabaseInput={"Name": db_name})
+                print(f"Glue database '{db_name}' created.")
+            except ClientError as create_error:
+                if create_error.response["Error"]["Code"] == "AlreadyExistsException":
+                    print(f"Glue database '{db_name}' was created by another job.")
+                else:
+                    raise
         else:
             raise
 

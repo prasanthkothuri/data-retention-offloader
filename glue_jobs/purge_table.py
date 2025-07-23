@@ -96,15 +96,15 @@ def run_discovery_mode(spark, iceberg_database, source_name):
                 table_schema = spark.sql(f"DESCRIBE glue_catalog.{iceberg_database}.{table_name}").collect()
                 column_names = [row['col_name'] for row in table_schema]
                 
-                if 'retention_expiry_date' not in column_names or 'legal_hold' not in column_names:
-                    logger.warning(f"Table {table_name} missing required columns (retention_expiry_date, legal_hold). Skipping.")
+                if 'retention_expires_at' not in column_names or 'legal_hold' not in column_names:
+                    logger.warning(f"Table {table_name} missing required columns (retention_expires_at, legal_hold). Skipping.")
                     continue
                 
                 # Count expired rows
                 count_query = f"""
                 SELECT COUNT(*) as expired_count
                 FROM glue_catalog.{iceberg_database}.{table_name}
-                WHERE retention_expiry_date < current_date()
+                WHERE retention_expires_at < current_date()
                 AND legal_hold = false
                 """
                 
@@ -184,7 +184,7 @@ def run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables):
             
             delete_query = f"""
             DELETE FROM glue_catalog.{iceberg_database}.{table_name}
-            WHERE retention_expiry_date < current_date()
+            WHERE retention_expires_at < current_date()
             AND legal_hold = false
             """
             
@@ -195,7 +195,7 @@ def run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables):
             verify_query = f"""
             SELECT COUNT(*) as remaining_expired_count
             FROM glue_catalog.{iceberg_database}.{table_name}
-            WHERE retention_expiry_date < current_date()
+            WHERE retention_expires_at < current_date()
             AND legal_hold = false
             """
             
@@ -222,13 +222,14 @@ def run_delete_mode(spark, iceberg_database, source_name, max_parallel_tables):
             }
             logger.error(f"Failed to purge table {table_name}: {str(e)}")
             return error_result
-    
-    # Use Spark's parallelism to process tables
-    sc = SparkContext.getOrCreate()
-    tables_rdd = sc.parallelize(tables_to_purge, max_parallel_tables)
-    
-    # Execute deletions in parallel
-    deletion_results = tables_rdd.map(delete_table_data).collect()
+
+    deletion_results = []
+    # Use ThreadPoolExecutor to run deletions in parallel on the driver
+    with ThreadPoolExecutor(max_workers=max_parallel_tables) as executor:
+        future_to_table = {executor.submit(delete_table_data, table): table for table in tables_to_purge}
+        
+        for future in as_completed(future_to_table):
+            deletion_results.append(future.result())
     
     # Summarize results
     successful_deletions = [r for r in deletion_results if r['status'] == 'success']

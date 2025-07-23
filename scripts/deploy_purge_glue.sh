@@ -99,7 +99,6 @@ if ! "${AWS_CMD[@]}" glue get-job --job-name "$GLUE_JOB_NAME" >/dev/null 2>&1; t
     --glue-version "$GLUE_VERSION" \
     --worker-type "G.1X" \
     --number-of-workers 2 \
-    --max-concurrent-runs 10 \
     --connections "$CONNECTIONS_ARG" >/dev/null
   echo "Glue job created."
 else

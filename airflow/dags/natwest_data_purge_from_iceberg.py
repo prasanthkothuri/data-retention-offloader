@@ -176,22 +176,37 @@ def run_discovery_glue_job(**context):
         error_message = status_response["JobRun"].get("ErrorMessage", "No error message provided.")
         raise AirflowException(f"Discovery Glue job failed with status '{job_status}'. Error: {error_message}")
 
-def purge_not_needed(**context):
+def wait_for_manual_approval(**context):
     """
-    Task to execute when no purge is needed
+    Manual approval step - user must mark this task as success
     """
     ti = context["ti"]
-    source_name = ti.xcom_pull(task_ids="parse_and_validate_purge_config", key="source_name")
+    discovery_job_run_id = ti.xcom_pull(task_ids="discover_tables_to_purge", key="discovery_job_run_id")
     
-    print(f"Purge process completed for {source_name}")
-    print("No expired data found - all tables are compliant with retention policies")
-    print("Summary:")
-    print("  - Tables scanned: Multiple")
-    print("  - Tables with expired data: 0") 
-    print("  - Total rows to delete: 0")
-    print("  - Action taken: None required")
+    print("=== MANUAL APPROVAL REQUIRED ===")
+    print(f"Discovery Job Run ID: {discovery_job_run_id}")
+    print("")
+    print("INSTRUCTIONS:")
+    print("1. Go to AWS Glue Console")
+    print("2. Review the discovery job logs")
+    print("3. Check what data will be purged")
+    print("4. If you approve: Mark this task as SUCCESS")
+    print("5. If you reject: Mark this task as FAILED")
+    print("")
+    print("⚠️  This task will remain RUNNING until you manually mark it")
+    print("⚠️  Only approve if you want to proceed with data deletion!")
     
-    return "No purge needed - retention policies are working correctly"
+    # This will keep the task running indefinitely until manually marked
+    import time
+    while True:
+        time.sleep(300)  # Sleep for 5 minutes, then check again
+        print("Still waiting for manual approval...")
+
+# Replace the DummyOperator with:
+approval_checkpoint = PythonOperator(
+    task_id="approval_checkpoint",
+    python_callable=wait_for_manual_approval,
+)
 
 def run_purge_glue_job(**context):
     """Run Glue job in delete mode to purge expired data"""
@@ -272,8 +287,9 @@ with DAG(
     )
 
     # Manual approval checkpoint
-    approval_checkpoint = DummyOperator(
+    approval_checkpoint = PythonOperator(
         task_id="approval_checkpoint",
+        python_callable=wait_for_manual_approval,
     )
 
     execute_purge = PythonOperator(
