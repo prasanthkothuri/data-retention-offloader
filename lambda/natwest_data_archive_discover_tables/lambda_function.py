@@ -91,23 +91,39 @@ def discover_tables(cursor, db_type, schemas):
 
 def lambda_handler(event, context):
     print("Received event:", json.dumps(event, indent=2))
-    
+
     connection_name = event.get("connection")
     include_rules = event.get("include", {})
     exclude_rules = event.get("exclude", {})
-    
+
     if not connection_name or not include_rules:
         raise ValueError("Event must include 'connection' and 'include' keys.")
-    
-    schemas = include_rules.get("schemas", [])
-    if not schemas:
+
+    # --- Parse schema/table/condition rules from new structure ---
+    schema_table_rules = []  # Each: {schema, table_pattern, condition}
+    schema_names = []  # For DB discovery
+
+    for schema_entry in include_rules.get("schemas", []):
+        schema_name = schema_entry["name"]
+        schema_names.append(schema_name)
+        for table_entry in schema_entry.get("tables", []):
+            table_name = table_entry["name"]
+            condition = table_entry.get("condition")
+            schema_table_rules.append({
+                "schema": schema_name,
+                "table_pattern": re.compile(table_name),
+                "condition": condition
+            })
+
+    if not schema_names:
         raise ValueError("Include rules must specify at least one schema.")
-    
+
+    # --- Fetch all tables from DB ---
     conn = None
     try:
         conn, db_type = get_db_connection(connection_name)
         cursor = conn.cursor()
-        all_tables = discover_tables(cursor, db_type, schemas)
+        all_tables = discover_tables(cursor, db_type, schema_names)
         cursor.close()
     except Exception as e:
         print(f"ERROR: {e}")
@@ -116,17 +132,29 @@ def lambda_handler(event, context):
         if conn:
             conn.close()
 
-    include_patterns = [re.compile(p) for p in include_rules.get("tables", [])]
+    # --- Optional: compile exclude patterns ---
     exclude_patterns = [re.compile(p) for p in exclude_rules.get("tables", [])]
 
+    # --- Match discovered tables with schema_table_rules ---
     discovered = []
     for item in all_tables:
-        name = item["table"]
-        included = not include_patterns or any(p.match(name) for p in include_patterns)
-        excluded = any(p.match(name) for p in exclude_patterns)
-        if included and not excluded:
-            discovered.append(item)
+        schema = item["schema"]
+        table = item["table"]
 
+        # Skip excluded tables
+        if any(p.match(table) for p in exclude_patterns):
+            continue
+
+        for rule in schema_table_rules:
+            if rule["schema"] == schema and rule["table_pattern"].match(table):
+                discovered.append({
+                    "schema": schema,
+                    "table": table,
+                    **({"condition": rule["condition"]} if rule["condition"] else {})
+                })
+                break  # Stop after first match
+
+    print(f"Discovered {len(discovered)} matching tables.")
     return {
         "source_name": event.get("name"),
         "discovered_tables": discovered

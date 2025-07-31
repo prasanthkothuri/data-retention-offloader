@@ -1,4 +1,3 @@
-# archive_table.py
 import sys
 import re
 import json
@@ -46,6 +45,7 @@ def _parse_retention_duration(text: str) -> timedelta:
 # --------------------------------------------------------------------------- #
 # Arg parsing
 # --------------------------------------------------------------------------- #
+
 args = getResolvedOptions(
     sys.argv,
     [
@@ -58,10 +58,13 @@ args = getResolvedOptions(
         "target_glue_table",
         "retention_policy_value",
         "legal_hold",
+        "condition",  # optional parameter
     ],
 )
 
 print(f"Starting archival for table: {args['source_schema']}.{args['source_table']}")
+if args.get("condition"):
+    print(f"Applying condition: {args['condition']}")
 
 # --------------------------------------------------------------------------- #
 # Initialize Spark/Glue context with Iceberg support
@@ -75,7 +78,6 @@ job.init(args["JOB_NAME"], args)
 parsed = urlparse(args["target_s3_path"])
 warehouse_root = f"s3://{parsed.netloc}/iceberg/"
 
-# These should already be present in --default-arguments, but also kept here for clarity
 spark.conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
 spark.conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
 spark.conf.set("spark.sql.catalog.glue_catalog.warehouse", warehouse_root)
@@ -83,72 +85,42 @@ spark.conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws
 spark.conf.set("spark.sql.defaultCatalog", "glue_catalog")
 
 # --------------------------------------------------------------------------- #
-# Get JDBC connection info from Glue to extract connection type
+# Prepare query with optional WHERE condition
 # --------------------------------------------------------------------------- #
-glue = boto3.client("glue")
-conn = glue.get_connection(Name=args["glue_connection_name"])['Connection']
-conn_type = conn['ConnectionType']
-conn_type = "oracle"
-# conn_properties = conn['ConnectionProperties']
+source_schema = args["source_schema"]
+source_table = args["source_table"]
+condition = args.get("condition")
 
-# jdbc_url = conn_properties['JDBC_CONNECTION_URL']
-# secret_id = conn_properties['SECRET_ID']
-# driver_class = conn_properties['JDBC_DRIVER_CLASS_NAME']
-
-# # --- 2. Fetch the Secret from AWS Secrets Manager ---
-# secrets_client = boto3.client('secretsmanager')
-# get_secret_value_response = secrets_client.get_secret_value(SecretId=secret_id)
-# # Secrets Manager stores credentials as a JSON string
-# secret = json.loads(get_secret_value_response['SecretString'])
-# db_username = secret['username']
-# db_password = secret['password']
-# server_dn = conn_properties['CUSTOM_JDBC_CERT_STRING']
-# server_dn = "CN=DataOrchestrationAWS_NFT, OU=Devices, OU=Proving G1 PKI Service, O=The Royal Bank of Scotland plc"
-
-# --------------------------------------------------------------------------- #
-# Read source table using GlueContext.getSource()
-# --------------------------------------------------------------------------- #
-# --- 3. Read Data Using the Discovered SSL Options ---
-# df = spark.read \
-#     .format("jdbc") \
-#     .option("url", jdbc_url) \
-#     .option("dbtable", f"{args['source_schema']}.{args['source_table']}") \
-#     .option("user", db_username) \
-#     .option("password", db_password) \
-#     .option("driver", driver_class) \
-#     .option("oracle.net.ssl_server_dn_match", "true") \
-#     .option("oracle.net.ssl_server_cert_dn", server_dn) \
-#     .option("javax.net.ssl.trustStore", "/opt/amazon/certs/InternalAndExternalAndAMSTrustStore.jks") \
-#     .option("javax.net.ssl.trustStoreType", "JKS") \
-#     .option("javax.net.ssl.trustStorePassword", "amazon") \
-#     .load()
+if condition:
+    query = f"(SELECT * FROM {source_schema}.{source_table} WHERE {condition})"
+else:
+    query = f"{source_schema}.{source_table}"
 
 connection_options = {
-        "useConnectionProperties": "true",
-        "dbtable": f"{args['source_schema']}.{args['source_table']}",
-        "connectionName": f"{args['glue_connection_name']}",
-    }
+    "useConnectionProperties": "true",
+    "dbtable": query,
+    "connectionName": args["glue_connection_name"],
+}
 
-# get dataframe
-# df = glueContext.getSource(
-#     connection_type = "oracle",
-#     options = connection_options
-# ).getFrame()
+print(f"Connection options:\n{json.dumps(connection_options, indent=2)}")
 
+# --------------------------------------------------------------------------- #
+# Read from source
+# --------------------------------------------------------------------------- #
 df = glueContext.create_dynamic_frame.from_options(
-    connection_type = "oracle",
-    connection_options = connection_options
+    connection_type="oracle",
+    connection_options=connection_options
 ).toDF()
 
-print(f"connection_options: {connection_options}")
-print(f"Read {df.count()} rows from {args['source_schema']}.{args['source_table']}")
+row_count = df.count()
+print(f"Read {row_count} rows from {source_schema}.{source_table}")
 
 # --------------------------------------------------------------------------- #
-# Add retention columns
+# Add retention metadata columns
 # --------------------------------------------------------------------------- #
-legal_hold = args['legal_hold'].lower() == 'true'
+legal_hold = args["legal_hold"].lower() == "true"
 now = datetime.utcnow()
-expires = now + _parse_retention_duration(args['retention_policy_value'])
+expires = now + _parse_retention_duration(args["retention_policy_value"])
 
 df = (
     df.withColumn("archived_at", F.lit(now))
@@ -157,21 +129,14 @@ df = (
 )
 
 # --------------------------------------------------------------------------- #
-# Write to Iceberg
+# Write to Iceberg table
 # --------------------------------------------------------------------------- #
 create_glue_database_if_not_exists(args["target_glue_db"])
 
-iceberg_table = f"`glue_catalog`.`{args['target_glue_db']}`.`{args['target_glue_table']}`"
+iceberg_table = f"glue_catalog.{args['target_glue_db']}.{args['target_glue_table'].lower()}"
 print(f"Writing to Iceberg table: {iceberg_table}")
 
-# (
-#     df.write.format("iceberg")
-#       .mode("overwrite")
-#       .option("path", args["target_s3_path"])
-#       .saveAsTable(iceberg_table)
-# )
-
-df.writeTo(f"glue_catalog.{args['target_glue_db']}.{args['target_glue_table'].lower()}").using("iceberg").createOrReplace()
+df.writeTo(iceberg_table).using("iceberg").createOrReplace()
 
 print("Archive complete.")
 job.commit()

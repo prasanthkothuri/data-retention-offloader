@@ -244,17 +244,24 @@ def prepare_glue_job_args(**context):
     for t in discovered:
         schema = t["schema"]
         table = t["table"]
+        condition = t.get("condition")
+
         s3_path = f"{wh_path.rstrip('/')}/{conn_name}/{schema}/{table}/"
-        args.append({
-            "--source_schema": schema,
-            "--source_table": table,
-            "--glue_connection_name": conn_val,
-            "--target_s3_path": s3_path,
-            "--target_glue_db": f"archive_{conn_val}",
-            "--target_glue_table": f"{schema}_{table}",
-            "--retention_policy_value": retention_value,
-            "--legal_hold": str(legal_hold).lower(),
-        })
+
+        glue_args = {
+        "--source_schema": schema,
+        "--source_table": table,
+        "--glue_connection_name": conn_val,
+        "--target_s3_path": s3_path,
+        "--target_glue_db": f"archive_{conn_val}",
+        "--target_glue_table": f"{schema}_{table}",
+        "--retention_policy_value": retention_value,
+        "--legal_hold": str(legal_hold).lower(),
+    }
+        if condition:
+            glue_args["--condition"] = condition
+
+        args.append(glue_args)
 
     print(f"Prepared args for {len(args)} tables.")
     return args
