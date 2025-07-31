@@ -125,8 +125,8 @@ conn_type = "oracle"
 
 connection_options = {
         "useConnectionProperties": "true",
-        "dbtable": 'edi_sup_owner.feed',
-        "connectionName": 'onprem_orcl_conn',
+        "dbtable": f"{args['source_schema']}.{args['source_table']}",
+        "connectionName": f"{args['glue_connection_name']}",
     }
 
 # get dataframe
@@ -140,6 +140,7 @@ df = glueContext.create_dynamic_frame.from_options(
     connection_options = connection_options
 ).toDF()
 
+print(f"connection_options: {connection_options}")
 print(f"Read {df.count()} rows from {args['source_schema']}.{args['source_table']}")
 
 # --------------------------------------------------------------------------- #
